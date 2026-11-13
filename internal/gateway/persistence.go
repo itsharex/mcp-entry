@@ -572,7 +572,11 @@ func clonePrincipal(p *principalState) *principalState {
 // publishPrincipalLocked 要求持有 g.mu；持久模式下状态与审计先一起提交，再发布身份、
 // 失效目录并取消旧操作。该锁与最终调用准入共享，使撤权和新准入有明确先后。
 func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system string, action AuditAction, own bool) error {
-	if !g.auditRoomLocked(1) {
+	room := g.auditRoomLocked(1)
+	if restrictivePrincipalChange(g.principals[id], p, system, action) {
+		room = g.auditRestrictionRoomLocked(1)
+	}
+	if !room {
 		return ErrAuditFull
 	}
 	actor := AuditActorOperator
@@ -597,6 +601,7 @@ func (g *Gateway) publishPrincipalLocked(id string, p *principalState, system st
 }
 func (g *Gateway) closeLocked() error {
 	g.closed = true
+	g.schemaExecutor.stop()
 	for key, session := range g.connectionSessions {
 		session.timer.Stop()
 		session.capability = [32]byte{}
@@ -626,6 +631,7 @@ func (g *Gateway) Close() error {
 	defer cancel()
 	g.mu.Lock()
 	g.closed = true
+	g.schemaExecutor.stop()
 	if g.closingContext == nil {
 		g.closingContext = ctx
 	}
@@ -633,6 +639,7 @@ func (g *Gateway) Close() error {
 		op.cancel()
 	}
 	g.mu.Unlock()
+	g.schemaExecutor.wait()
 	// 等待时不能持有 g.mu：操作结束仍需取得该锁写终态审计。上面的五秒
 	// 上下文限制关闭期间的审计 I/O，不是 Wait 的硬超时或下游回滚保证。
 	g.operationWG.Wait()

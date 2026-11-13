@@ -20,11 +20,14 @@ var (
 
 // Config is deliberately a local, synthetic-credential configuration, not a vault.
 type Config struct {
-	Ingress IngressConfig   `json:"ingress,omitempty"`
-	Limits  LimitsConfig    `json:"limits,omitempty"`
-	Audit   AuditConfig     `json:"audit,omitempty"`
-	Systems []System        `json:"systems"`
-	Users   map[string]User `json:"users"`
+	// Runtime-only. Nil retains legacy in-process schema execution for library
+	// callers; the gateway CLI explicitly enables its trusted self-helper.
+	SchemaIsolation *SchemaIsolation `json:"-"`
+	Ingress         IngressConfig    `json:"ingress,omitempty"`
+	Limits          LimitsConfig     `json:"limits,omitempty"`
+	Audit           AuditConfig      `json:"audit,omitempty"`
+	Systems         []System         `json:"systems"`
+	Users           map[string]User  `json:"users"`
 }
 
 // System 定义管理员配置的固定下游及认证方式；请求参数不能覆盖路由。

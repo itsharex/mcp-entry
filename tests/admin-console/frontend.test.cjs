@@ -359,6 +359,15 @@ async function login() {
     assert.match(content(), /不代表历史没有错误/);
     assert.match(content(), /2026.*10.*23.*UTC/,'readable timestamp includes explicit timezone');
     elements.refresh.fire('click');
+    await respond({...snapshot,audit:{...snapshot.audit,persistent:true,healthy:true,retained:4094,reserved:1,remaining:1,regular_remaining:0,restriction_reserve:2,operation_ready:false,restriction_ready:true}});
+    click('运行与审计');
+    assert.match(content(),/剩余审计槽/);assert.match(content(),/新业务审计准入不可用/);
+    assert.match(content(),/Healthy 仅表示未检测到存储故障/);
+    assert.doesNotMatch(content(),/限制动作也无可用审计准入/);
+    elements.refresh.fire('click');
+    await respond({...snapshot,audit:{...snapshot.audit,persistent:true,healthy:true,remaining:0,regular_remaining:0,operation_ready:false,restriction_ready:false}});
+    click('运行与审计');assert.match(content(),/失败不表示撤权已持久化/);
+    elements.refresh.fire('click');
     elements.disconnect.fire('click');
     await respond(snapshot);
     assert.equal(elements.authentication.hidden,

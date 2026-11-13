@@ -30,9 +30,9 @@ Earlier parent deadlines win. Transport stages share the operation's remaining t
 
 | Boundary | Budget | Scope / source |
 | --- | --- | --- |
-| Caller deadline/cancellation | Caller supplied | Can terminate any remaining operation phase |
+| Caller deadline/cancellation | Caller supplied | Bounds context-aware work; synchronous preparation/schema validation is not interruptible |
 | Discovery operation | 5 s | `discover` in `internal/gateway/gateway.go`; includes connection, catalog pages, synchronous cleanup |
-| Tool-call operation | 10 s | `Call` in `internal/gateway/gateway.go`; includes admission, connection, call and synchronous cleanup |
+| Tool-call operation | 10 s | `Call` in `internal/gateway/gateway.go`; starts after initial authorization, before argument preparation/schema validation; includes final admission, connection, call and synchronous cleanup |
 | Downstream HTTP client | 12 s | Per HTTP request, including response-body reads; `downstreamOperationClient` |
 | DNS resolution | 3 s | `internal/gateway/network_policy.go` |
 | Dial | 3 s | Network policy dialer |
@@ -74,6 +74,17 @@ cleanup. The HTTP client cap is derived as `max(discovery, call) + 2 seconds`
 fresh operation allowance. DNS, dial and TLS remain capped at three seconds.
 No proxy, TLS, IP allowlist, endpoint, authentication or retry policy changes.
 A large header budget does not reserve time for the body or cleanup.
+
+Argument preparation and schema validation consume the call budget; they do not
+earn a fresh budget when they finish. If the deadline expires during successful
+preparation or validation, `Call` returns the context error without contacting the
+downstream. Final authorization/revision checks remain mandatory before dispatch.
+This is deadline accounting, **not a hard execution-time guarantee**: synchronous
+JSON encoding and schema validation cannot be interrupted by context cancellation.
+Schema admission/compilation and CPU isolation remain separate unfinished work.
+`TestCallBudgetIncludesArgumentPreparation` uses a synthetic synchronous encoder
+to verify exhausted service budgets, earlier parent deadlines, cancellation and a
+healthy control, counting all downstream requests rather than only business calls.
 
 Budgets are local runtime settings, excluded from the authenticated identity/
 routing topology fingerprint. Existing databases remain readable without a

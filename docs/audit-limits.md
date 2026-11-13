@@ -43,3 +43,5 @@ Gateway.GuardHTTP 包装整个路由树；Handler 和 AccountHandler 默认也�
 Gateway.RejectionStatus() 仅供受信任进程内调用，无公开管理端点。Started 标记本进程统计起点；每个固定类别只有 Count、Last、Saturated，计数饱和后不回绕。不保存身份、IP、URL、token、参数、错误原文或不可信工具名，不新增 SQLite 表或持久格式，不占必需事务审计容量，重启后归零。
 
 HTTP 数组按 RejectionIngressGlobal、RejectionIngressPrincipal、RejectionAuthentication、RejectionAuthorization、RejectionRequest、RejectionHTTPUnavailable 顺序计数，每个可观察到的拒绝响应一次。Operations 数组按授权、参数/schema、出站准入、协议拒绝顺序计数（索引为对应枚举减 RejectionOperationAuthorization），包含 HTTP 200 中的前置 MCP 操作拒绝，以及直接库调用拒绝。二者统计单位不同，不能相加宣称“请求总数”；一次 HTTP 请求可以承载多个协议操作。下游已执行后的工具业务错误仍由既有操作审计描述，不冒充入口拒绝。SDK 在方法中间件之前拒绝的协议内容及宿主在 GuardHTTP 之前拒绝的连接/原始头，不保证出现在这些摘要中。它们不是逐请求取证记录、持久访问日志或完整审计覆盖。
+
+当前持久容量/终态预留可观测字段及显式限制动作预留见[审计容量](audit-capacity.md)。Healthy 不表示业务审计准入可用。

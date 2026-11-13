@@ -145,7 +145,11 @@ func (g *Gateway) adminLifecycle(w http.ResponseWriter, in lifecycleRequest, tic
 		response(200, map[string]any{"preview": true, "action": in.Action, "expected_generation": in.Expected, "confirmation_id": key, "confirmation_expires_at": expiry})
 		return
 	}
-	if !g.auditRoomLocked(1) {
+	room := g.auditRoomLocked(1)
+	if in.Action == "revoke_entry" && !p.entry.Revoked {
+		room = g.auditRestrictionRoomLocked(1)
+	}
+	if !room {
 		failure(ErrAuditFull)
 		return
 	}

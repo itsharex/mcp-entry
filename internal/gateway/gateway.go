@@ -3,21 +3,21 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	exactschema "github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 var ErrDenied = errors.New("tool unavailable or access denied")
@@ -46,6 +46,7 @@ type snapshot struct {
 // Gateway 由运行服务注册表、可变身份状态和只读目录快照组成。mu 串行化授权变更、
 // 最终准入及审计发布；网络 I/O 在锁外执行，完成后再检查版本是否仍可发布。
 type Gateway struct {
+	schemaExecutor          *schemaExecutor
 	clientBindingEnabled    atomic.Bool
 	clientBindingOrigin     string
 	connectionSessions      map[string]*connectionSession
@@ -60,6 +61,7 @@ type Gateway struct {
 	auditUnfinished         map[string]bool
 	auditIDKey              []byte
 	auditCapacity           int
+	auditRestrictionReserve int
 	auditPending            uint64
 	auditFault              bool
 	closed                  bool
@@ -198,6 +200,10 @@ func newGateway(cfg Config, bootstrap bool) (*Gateway, error) {
 		g.users[id] = user
 	}
 	g.state.Store(g.makeSnapshot(map[string]map[string]entry{}))
+	g.schemaExecutor, err = newSchemaExecutor(cfg.SchemaIsolation)
+	if err != nil {
+		return nil, err
+	}
 	return g, nil
 }
 
@@ -249,13 +255,15 @@ func (g *Gateway) Refresh(ctx context.Context) []DiscoveryIssue {
 // filter tools or inspect header annotations. Its authorization view is immutable
 // and belongs to one discovery attempt, never to the session's later policy.
 type catalogAdmission struct {
-	system  string
-	allowed map[string]bool
-	names   map[string]bool
-	cursors map[string]bool
-	total   int
-	bytes   int
-	pages   int
+	executor *schemaExecutor
+	compiled map[string]*boundedSchema
+	system   string
+	allowed  map[string]bool
+	names    map[string]bool
+	cursors  map[string]bool
+	total    int
+	bytes    int
+	pages    int
 }
 
 func (a *catalogAdmission) admit(ctx context.Context, list *mcp.ListToolsResult) error {
@@ -305,7 +313,21 @@ func (a *catalogAdmission) admit(ctx context.Context, list *mcp.ListToolsResult)
 		}
 		// Fail selected tools before SDK filterValidTools can silently drop them or
 		// log schema-derived errors. Compilation still occurs atomically in discover.
-		for _, schema := range schemas {
+		for i, schema := range schemas {
+			if a.executor != nil {
+				compiled, err := resolveIsolatedSchema(ctx, a.executor, schema, i == 0)
+				if err != nil {
+					var rejected *schemaAdmissionError
+					if errors.As(err, &rejected) {
+						return observeSchemaAdmission(ctx, err)
+					}
+					return err
+				}
+				if i == 0 {
+					a.compiled[tool.Name] = compiled
+				}
+				continue
+			}
 			if _, err := analyzeSchema(schema); err != nil {
 				return observeSchemaAdmission(ctx, err)
 			}
@@ -323,9 +345,26 @@ func connect(ctx context.Context, system System, token string, admission *catalo
 	client := mcp.NewClient(&mcp.Implementation{Name: "mcp-entry", Version: "0.2.0-demo"}, &mcp.ClientOptions{MultiRoundTrip: &mcp.MultiRoundTripOptions{Disabled: true}})
 	client.AddSendingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			var capture *wireCapture
+			if method == "tools/list" || method == "tools/call" {
+				ctx, capture = withWireNumbers(ctx, method)
+			}
 			result, err := next(ctx, method, req)
 			if err != nil {
 				return nil, err
+			}
+			if capture != nil {
+				raw, err := capture.result()
+				if err == nil {
+					err = restoreWireNumbers(result, raw)
+				}
+				if err != nil {
+					var admission *schemaAdmissionError
+					if errors.As(err, &admission) {
+						err = observeSchemaAdmission(ctx, err)
+					}
+					return nil, err
+				}
 			}
 			if method == "tools/list" {
 				list, ok := result.(*mcp.ListToolsResult)
@@ -347,7 +386,7 @@ func (g *Gateway) discover(ctx context.Context, system System, token string, all
 	defer cancel()
 	ctx, observation := withFailureObservation(ctx)
 	observation.setPhase(FailureConnect)
-	admission := &catalogAdmission{system: system.Name, allowed: allowed, names: map[string]bool{}, cursors: map[string]bool{}}
+	admission := &catalogAdmission{executor: g.schemaExecutor, compiled: map[string]*boundedSchema{}, system: system.Name, allowed: allowed, names: map[string]bool{}, cursors: map[string]bool{}}
 	session, err := connect(ctx, system, token, admission)
 	if err != nil {
 		return nil, classifyDownstreamFailure(ctx, FailureConnect, err, false)
@@ -384,14 +423,19 @@ func (g *Gateway) discover(ctx context.Context, system System, token string, all
 				return nil, err
 			}
 			var copy mcp.Tool
-			if err := json.Unmarshal(data, &copy); err != nil {
+			decoder := json.NewDecoder(bytes.NewReader(data))
+			decoder.UseNumber()
+			if err := decoder.Decode(&copy); err != nil {
 				return nil, err
 			}
-			resolved, err := resolveSchema(copy.InputSchema, true)
+			resolved := admission.compiled[tool.Name]
+			if g.schemaExecutor == nil {
+				resolved, err = resolveSchema(copy.InputSchema, true)
+			}
 			if err != nil {
 				return nil, err
 			}
-			if copy.OutputSchema != nil {
+			if g.schemaExecutor == nil && copy.OutputSchema != nil {
 				if _, err := resolveSchema(copy.OutputSchema, false); err != nil {
 					return nil, err
 				}
@@ -415,7 +459,9 @@ func (g *Gateway) discover(ctx context.Context, system System, token string, all
 // boundedSchema retains the validator's dialect semantics without rewriting the
 // advertised schema. Admission limits are not a wall-clock CPU interruption.
 type boundedSchema struct {
-	resolved *jsonschema.Resolved
+	executor *schemaExecutor
+	raw      []byte
+	resolved *exactschema.Schema
 	work     int
 }
 
@@ -436,30 +482,7 @@ func resolveSchema(value any, input bool) (result *boundedSchema, retErr error) 
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSchemaTypes(value); err != nil {
-		return nil, err
-	}
-	data, err := json.Marshal(value)
-	if err != nil {
-		return nil, err
-	}
-	var schema jsonschema.Schema
-	if err := json.Unmarshal(data, &schema); err != nil {
-		return nil, err
-	}
-	if input && schema.Type != "object" {
-		return nil, errors.New("input schema must describe object")
-	}
-	switch schema.Schema {
-	case "", "https://json-schema.org/draft/2020-12/schema", "http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft-07/schema#":
-	default:
-		return nil, errors.New("unsupported schema draft")
-	}
-	resolved, err := schema.Resolve(&jsonschema.ResolveOptions{
-		Loader: func(*url.URL) (*jsonschema.Schema, error) {
-			return nil, errors.New("external schema loading disabled")
-		},
-	})
+	resolved, err := compileExactSchema(value, input)
 	if err != nil {
 		return nil, err
 	}
@@ -473,9 +496,19 @@ func validateSchemaTypes(value any) error {
 	if !ok {
 		return nil
 	}
-	for _, key := range []string{"$dynamicRef", "x-mcp-header"} {
+	for _, key := range []string{"$dynamicRef", "$recursiveRef", "$recursiveAnchor", "x-mcp-header"} {
 		if _, exists := schema[key]; exists {
-			return errors.New("dynamic references and header mappings unsupported")
+			return errors.New("dynamic or recursive references and header mappings unsupported")
+		}
+	}
+	// A nested resource can select its own dialect in the exact validator.
+	// Enforce the supported set at every schema position, not only the root,
+	// so unaccounted draft-2019 recursive edges cannot bypass our DAG budget.
+	if dialect, exists := schema["$schema"]; exists {
+		switch dialect {
+		case "", "https://json-schema.org/draft/2020-12/schema", "http://json-schema.org/draft-07/schema#", "https://json-schema.org/draft-07/schema#":
+		default:
+			return errors.New("unsupported schema draft")
 		}
 	}
 	if typ, exists := schema["type"]; exists {
@@ -562,6 +595,11 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 		g.rejectOperation(ctx, RejectionOperationAuthorization)
 		return nil, ErrDenied
 	}
+	// Preparation and schema validation consume the same operation budget as
+	// dispatch. These synchronous steps are not interruptible, but must not grant
+	// a fresh downstream allowance after they have exhausted the deadline.
+	ctx, cancel := context.WithTimeout(ctx, e.system.timeoutBudgets().call)
+	defer cancel()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -576,8 +614,8 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("invalid tool arguments")
 	}
-	var input any
-	if err := json.Unmarshal(data, &input); err != nil {
+	input, err := decodeExactJSON(data, MaxInstanceDepth, MaxInstanceNodes)
+	if err != nil {
 		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("invalid tool arguments")
 	}
@@ -586,12 +624,21 @@ func (g *Gateway) Call(ctx context.Context, id, name string, args any) (result *
 	}
 	// schema 校验可能耗时，先在锁外完成；下方最终准入会重新确认同一目录版本，
 	// 防止校验期间发生的撤权或刷新被这次调用越过。
-	if err := e.input.Validate(input); err != nil {
+	if e.input.executor != nil {
+		err = e.input.executor.execute(ctx, schemaValidateInput, e.input.raw, data)
+	} else {
+		err = e.input.Validate(input)
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return nil, contextErr
+	}
+	if err != nil {
+		if e.input.executor != nil && !errors.Is(err, errSchemaInstance) {
+			return nil, err
+		}
 		g.rejectOperation(ctx, RejectionOperationArguments)
 		return nil, errors.New("arguments do not match discovered schema")
 	}
-	ctx, cancel := context.WithTimeout(ctx, e.system.timeoutBudgets().call)
-	defer cancel()
 	// Final dispatch admission and revocation share this lock. A request admitted
 	// first is in flight even if its first network byte is sent later.
 	g.mu.Lock()
@@ -854,7 +901,7 @@ func downstreamOperationClient(ctx context.Context, token string, system System)
 		}
 		base.(*endpointTransport).base.ResponseHeaderTimeout = budgets.responseHeader
 	}
-	return &http.Client{Transport: observeFailureTransport(ctx, credentialTransport{auth: system.Auth, token: token, base: base, operation: ctx}), Timeout: budgets.client, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
+	return &http.Client{Transport: observeFailureTransport(ctx, numberCaptureTransport{base: credentialTransport{auth: system.Auth, token: token, base: base, operation: ctx}}), Timeout: budgets.client, CheckRedirect: func(*http.Request, []*http.Request) error { return errors.New("redirect refused") }}
 }
 
 type deniedTransport struct{}

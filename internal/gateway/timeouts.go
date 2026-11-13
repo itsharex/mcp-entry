@@ -17,13 +17,17 @@ type TimeoutConfig struct {
 
 type timeoutBudgets struct{ discovery, call, responseHeader, client time.Duration }
 
+// MaxOperationTimeout is the supported per-service operation ceiling. Ingress
+// transport budgets must leave room for this ceiling, not only legacy defaults.
+const MaxOperationTimeout = 120 * time.Second
+
 func resolveTimeouts(c *TimeoutConfig) (timeoutBudgets, error) {
 	b := timeoutBudgets{5 * time.Second, 10 * time.Second, 5 * time.Second, 12 * time.Second}
 	if c == nil {
 		return b, nil
 	}
 	for _, v := range []int{c.DiscoveryMS, c.CallMS, c.ResponseHeaderMS} {
-		if v <= 0 || v > 120000 {
+		if v <= 0 || v > int(MaxOperationTimeout/time.Millisecond) {
 			return timeoutBudgets{}, errors.New("timeouts must contain positive milliseconds no greater than 120000")
 		}
 	}

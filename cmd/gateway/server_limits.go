@@ -18,10 +18,16 @@ const (
 	maxInboundHTTP2Streams = 32
 	inboundHeaderTimeout   = 5 * time.Second
 	inboundReadTimeout     = gateway.IngressReadTimeout
-	// Allow the existing 10-second tool deadline and terminal audit persistence
-	// to finish and deliver confirmed results; do not wrap handlers in TimeoutHandler.
-	inboundWriteTimeout = 60 * time.Second
-	inboundIdleTimeout  = 30 * time.Second
+	// The server accepts runtime profiles up to MaxOperationTimeout. Reserve
+	// ingress time (including TLS/header handling), independent start/terminal
+	// audit transactions and delivery. The start transaction can cross the
+	// operation deadline; its tail must not consume the delivery allowance.
+	// Keep the transport finite,
+	// without resetting deadlines per write or using an unbounded timeout.
+	// This is a finite transport ceiling, not proof of client receipt or rollback.
+	inboundDeliveryAllowance = 10 * time.Second
+	inboundWriteTimeout      = inboundHeaderTimeout + inboundReadTimeout + gateway.MaxOperationTimeout + 2*gateway.AuditCommitTimeout + inboundDeliveryAllowance
+	inboundIdleTimeout       = 30 * time.Second
 )
 
 func newGatewayHTTPServer(handler http.Handler, tlsConfig *tls.Config) *http.Server {

@@ -70,7 +70,11 @@ func (g *Gateway) mutateEntry(identity Identity, expected uint64, digest *[32]by
 			}
 		}
 	}
-	if !g.auditRoomLocked(1) {
+	room := g.auditRoomLocked(1)
+	if digest == nil && !p.entry.Revoked {
+		room = g.auditRestrictionRoomLocked(1)
+	}
+	if !room {
 		return EntryInfo{}, ErrAuditFull
 	}
 	// 这里只替换值类型的入口元数据；共享的策略和绑定容器均不写入。

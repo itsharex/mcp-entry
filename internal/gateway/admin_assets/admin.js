@@ -831,6 +831,10 @@
         ['审计容量',
           'Audit capacity',
           'capacity'],
+        ['当前保留记录','Retained records','retained'],
+        ['剩余审计槽','Remaining audit slots','remaining'],
+        ['普通操作剩余槽','Regular slots remaining','regular_remaining'],
+        ['限制动作预留','Restriction reserve','restriction_reserve'],
         ['丢弃事件',
           'Dropped events',
           'dropped'],
@@ -844,6 +848,10 @@
             text('审计存储快照',
               'Audit storage snapshot'))));
       c.appendChild(m);
+      if(a.persistent&&a.operation_ready===false)c.appendChild(help(text('新业务审计准入不可用','New operation audit admission unavailable'),
+        text('Healthy 仅表示未检测到存储故障，不代表容量充足。检查剩余槽、关闭与维护状态；限制动作仍须授权、版本检查和持久提交。','Healthy only means no detected storage fault, not sufficient capacity. Check remaining slots, shutdown and maintenance state; restrictions still require authorization, version checks and durable commit.')));
+      if(a.persistent&&a.restriction_ready===false)c.appendChild(help(text('限制动作也无可用审计准入','Restriction audit admission also unavailable'),
+        text('请按受信离线归档或停服维护流程处理。失败不表示撤权已持久化，不要直接重试未知提交。','Use the trusted offline archival or shutdown maintenance procedure. Failure does not establish durable revocation; do not blindly retry an unknown commit.')));
       const p=panel(text('保留事件',
           'Retained events'),
         text('最多读取前 100 条保留事件；不代表完整历史。未知结果不得自动重放。',

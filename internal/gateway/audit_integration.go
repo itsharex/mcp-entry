@@ -12,11 +12,25 @@ import (
 // AuditConfig bounds metadata retention. Persistent journals never prune silently.
 type AuditConfig struct {
 	Capacity int `json:"capacity,omitempty"`
+	// Optional physical journal slots reserved for actual privilege reduction.
+	// Zero preserves historical admission behavior; no extra storage is created.
+	RestrictionReserve int `json:"restriction_reserve,omitempty"`
 }
+
+// AuditCommitTimeout bounds a normal durable audit transaction, including the
+// terminal record written after an operation deadline has been exhausted.
+const AuditCommitTimeout = time.Second
 
 // AuditStatus 区分运行中预留终态槽的 Pending 与缺少终态记录的 Unfinished。
 // 后者包含历史崩溃遗留及已归档的未知结果，不等于当前并发操作数。
 type AuditStatus struct {
+	Retained           uint64 `json:"retained"`
+	Reserved           uint64 `json:"reserved"`
+	Remaining          uint64 `json:"remaining"`
+	RegularRemaining   uint64 `json:"regular_remaining"`
+	RestrictionReserve int    `json:"restriction_reserve"`
+	OperationReady     bool   `json:"operation_ready"`
+	RestrictionReady   bool   `json:"restriction_ready"`
 	ArchivedUnfinished uint64 `json:"archived_unfinished"`
 	Persistent         bool   `json:"persistent"`
 	Healthy            bool   `json:"healthy"`
@@ -34,7 +48,9 @@ func (g *Gateway) AuditStatus() AuditStatus {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	page, _ := g.auditRing.Read(AuditFilter{Limit: 1})
-	return AuditStatus{ArchivedUnfinished: g.auditArchivedUnfinished, Persistent: g.store != nil, Healthy: !g.auditFault, Closed: g.closed, Pending: g.auditPending, Unfinished: g.auditArchivedUnfinished + uint64(len(g.auditUnfinished)), LastSequence: page.LastSequence, Dropped: page.Dropped, Capacity: g.auditCapacity}
+	retained, remaining, regular := g.auditCapacityLocked()
+	usable := !g.auditFault && !g.closed
+	return AuditStatus{Retained: retained, Reserved: g.auditPending, Remaining: remaining, RegularRemaining: regular, RestrictionReserve: g.auditRestrictionReserve, OperationReady: usable && !g.maintenance && (g.store == nil || regular >= 2), RestrictionReady: usable && (g.store == nil || remaining >= 1), ArchivedUnfinished: g.auditArchivedUnfinished, Persistent: g.store != nil, Healthy: !g.auditFault, Closed: g.closed, Pending: g.auditPending, Unfinished: g.auditArchivedUnfinished + uint64(len(g.auditUnfinished)), LastSequence: page.LastSequence, Dropped: page.Dropped, Capacity: g.auditCapacity}
 }
 
 // Audit is a trusted operator API, not an authenticated HTTP audit endpoint.
@@ -54,11 +70,15 @@ func (g *Gateway) initializeAudit(cfg AuditConfig) error {
 	if cfg.Capacity == 0 {
 		cfg.Capacity = DefaultAuditCapacity
 	}
+	if cfg.RestrictionReserve < 0 || (cfg.RestrictionReserve > 0 && cfg.RestrictionReserve > cfg.Capacity-2) {
+		return ErrAuditInvalid
+	}
 	ring, err := NewAuditRing(cfg.Capacity)
 	if err != nil {
 		return err
 	}
 	g.auditCapacity = cfg.Capacity
+	g.auditRestrictionReserve = cfg.RestrictionReserve
 	g.auditRing = ring
 	g.auditUnfinished = make(map[string]bool)
 	g.auditIDKey = make([]byte, 32)
@@ -80,7 +100,41 @@ func (g *Gateway) auditEventLocked(id, system, tool string, p *principalState, a
 // auditRoomLocked 要求持有 g.mu；持久容量同时计入已有日志和已预留的终态槽。
 // 内存模式允许日志环淘汰，因而不在这里拒绝新增事件。
 func (g *Gateway) auditRoomLocked(extra uint64) bool {
-	return g.store == nil || g.store.auditSequence-g.store.auditBaseSequence+g.auditPending+extra <= uint64(g.auditCapacity)
+	if g.store == nil {
+		return true
+	}
+	_, _, regular := g.auditCapacityLocked()
+	return extra <= regular
+}
+
+// g.mu is held throughout. Pending terminal reservations are never borrowable,
+// including by emergency restrictions. Sequence is not retained row count after
+// archival; the authenticated base is part of the calculation.
+func (g *Gateway) auditCapacityLocked() (retained, remaining, regular uint64) {
+	if g.store != nil {
+		retained = g.store.auditSequence - g.store.auditBaseSequence
+	} else {
+		g.auditRing.mu.Lock()
+		retained = uint64(len(g.auditRing.events))
+		g.auditRing.mu.Unlock()
+	}
+	used := retained + g.auditPending
+	if used < uint64(g.auditCapacity) {
+		remaining = uint64(g.auditCapacity) - used
+	}
+	limit := uint64(g.auditCapacity - g.auditRestrictionReserve)
+	if used < limit {
+		regular = limit - used
+	}
+	return
+}
+
+func (g *Gateway) auditRestrictionRoomLocked(extra uint64) bool {
+	if g.store == nil {
+		return true
+	}
+	_, remaining, _ := g.auditCapacityLocked()
+	return extra <= remaining
 }
 func (g *Gateway) auditFailureLocked() { g.auditFault = true; g.closeLocked() }
 
@@ -195,7 +249,7 @@ func (g *Gateway) auditContext() (context.Context, context.CancelFunc) {
 	if g.closingContext != nil {
 		parent = g.closingContext
 	}
-	return context.WithTimeout(parent, time.Second)
+	return context.WithTimeout(parent, AuditCommitTimeout)
 }
 
 // writeAudit 只在调用方事务内追加一条记录，不修改 store 的内存链头。

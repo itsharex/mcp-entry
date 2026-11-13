@@ -120,7 +120,7 @@ func serveLimited(t *testing.T, s *http.Server, l *boundedListener) {
 
 func TestInboundHTTPBudgets(t *testing.T) {
 	s := newGatewayHTTPServer(http.NotFoundHandler(), nil)
-	if s.MaxHeaderBytes != maxInboundHeaderBytes || s.MaxHeaderBytes <= 0 || s.ReadHeaderTimeout != 5*time.Second || s.ReadTimeout != inboundReadTimeout || s.WriteTimeout != 60*time.Second || s.IdleTimeout != 30*time.Second {
+	if s.MaxHeaderBytes != maxInboundHeaderBytes || s.MaxHeaderBytes <= 0 || s.ReadHeaderTimeout != 5*time.Second || s.ReadTimeout != inboundReadTimeout || s.WriteTimeout != inboundWriteTimeout || s.IdleTimeout != 30*time.Second {
 		t.Fatal("missing explicit finite HTTP budgets")
 	}
 	if s.HTTP2 == nil || s.HTTP2.MaxConcurrentStreams != 32 || s.HTTP2.WriteByteTimeout <= 0 {

@@ -1,3 +1,5 @@
+> 历史可行性记录。P1 已实现的当前边界见 [schema-execution.md](schema-execution.md)；下文旧原型状态和测量不代表当前交付验收。
+
 # Schema execution isolation — feasibility design, not shipped support
 
 Status: synthetic local prototype, 2026-10-23. **The gateway still validates in
@@ -23,9 +25,12 @@ result. That older measurement is historical context, not newly rerun here.
 This is expensive repeated linear regex work, not a catastrophic-backtracking
 claim about Go's regex engine.
 
-In the reviewed gateway snapshot, validation occurs before the downstream call
-context/limiter. Context cancellation alone cannot interrupt synchronous regex
-validation. Structural budgets are still valuable but cannot guarantee execution
+In the originally reviewed gateway snapshot, validation occurred before the call
+context/limiter. The call budget now starts before argument preparation and
+validation, preventing late downstream dispatch after that budget is exhausted;
+validation still runs before the downstream limiter. This accounting fix does
+not implement the isolation proposed here. Context cancellation cannot interrupt
+synchronous regex validation. Structural budgets are still valuable but cannot guarantee execution
 time. Admission and compilation need isolation too, not only `Resolved.Validate`.
 
 ## Proposed design: disposable one-shot helper, not a pool

@@ -349,6 +349,10 @@ func operate(g *gateway.Gateway, cfg gateway.Config, o options, output io.Writer
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return runWithSchemaHelper(args, stdin, stdout, stderr, "")
+}
+
+func runWithSchemaHelper(args []string, stdin io.Reader, stdout, stderr io.Writer, executable string) error {
 	o, err := parseOptions(args, stdout)
 	if errors.Is(err, flag.ErrHelp) {
 		return nil
@@ -378,6 +382,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	file.Close()
 	if err != nil {
 		return err
+	}
+	if executable != "" && o.operation == "serve" {
+		cfg.SchemaIsolation = &gateway.SchemaIsolation{Executable: executable, Capacity: 2, Timeout: time.Second}
 	}
 	if o.credentialsFile != "" {
 		cfg, err = loadCredentials(cfg, o.credentialsFile)
@@ -565,7 +572,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 func main() {
-	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
+	if len(os.Args) == 2 && os.Args[1] == gateway.SchemaHelperArgument {
+		if gateway.RunSchemaHelper(os.Stdin, os.Stdout) != nil {
+			os.Exit(1)
+		}
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		log.Fatal("cannot resolve schema helper executable")
+	}
+	if err := runWithSchemaHelper(os.Args[1:], os.Stdin, os.Stdout, os.Stderr, executable); err != nil {
 		log.Fatal(err)
 	}
 }
